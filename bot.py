@@ -7,6 +7,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from functools import partial
 from typing import List, Optional, Tuple
@@ -29,13 +30,35 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
-IG_USER     = os.environ.get("IG_USER", "")
-IG_PASS     = os.environ.get("IG_PASS", "")
+IG_COOKIES  = os.environ.get("IG_COOKIES", "")   # contenu du cookies.txt
 _raw_group  = os.environ.get("GROUP_ID", "")
 GROUP_ID    = int(_raw_group) if _raw_group else None
 
 DOWNLOAD_DIR   = Path("/tmp/ig_downloads")
 MAX_FILE_BYTES = 50 * 1024 * 1024   # 50 Mo
+
+_cookies_tmp_path: Optional[str] = None   # cache du fichier temporaire
+
+
+# ── Cookies helper ────────────────────────────────────────────────────────────
+def get_cookies_file() -> Optional[str]:
+    """
+    Ecrit IG_COOKIES dans un fichier temporaire (une seule fois) et retourne
+    le chemin. Retourne None si IG_COOKIES est vide.
+    """
+    global _cookies_tmp_path
+    if not IG_COOKIES:
+        return None
+    if _cookies_tmp_path and Path(_cookies_tmp_path).exists():
+        return _cookies_tmp_path
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="ig_cookies_"
+    )
+    tmp.write(IG_COOKIES)
+    tmp.close()
+    _cookies_tmp_path = tmp.name
+    logger.info("Cookies Instagram ecrits dans %s", _cookies_tmp_path)
+    return _cookies_tmp_path
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -45,7 +68,6 @@ def esc(text: str) -> str:
 
 def extract_username(text: str) -> Optional[str]:
     text = text.strip()
-    # Nettoyer les parametres d'URL (?hl=fr, etc.)
     text = text.split("?")[0].rstrip("/")
     for pattern in (
         r"instagram\.com/([A-Za-z0-9._]+)",
@@ -68,7 +90,6 @@ def human_size(n: int) -> str:
 
 
 def collect_media_files(directory: Path) -> Tuple[List[Path], List[str]]:
-    """Collecte tous les fichiers media valides dans un dossier."""
     files: List[Path] = []
     skipped: List[str] = []
     if not directory.exists():
@@ -89,12 +110,8 @@ def collect_media_files(directory: Path) -> Tuple[List[Path], List[str]]:
     return files, skipped
 
 
-# ── METHODE 1 : yt-dlp (posts & reels, sans login) ───────────────────────────
+# ── METHODE 1 : yt-dlp avec cookies ──────────────────────────────────────────
 def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
-    """
-    Telecharge tous les posts et reels via yt-dlp.
-    Retourne la liste des erreurs/avertissements.
-    """
     profile_dir.mkdir(parents=True, exist_ok=True)
     errors: List[str] = []
 
@@ -107,8 +124,16 @@ def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
         "-o", str(profile_dir / "%(upload_date)s_%(id)s.%(ext)s"),
         "--merge-output-format", "mp4",
         "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "https://www.instagram.com/{}/".format(username),
     ]
+
+    cookies_file = get_cookies_file()
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+        logger.info("yt-dlp : utilisation des cookies Instagram")
+    else:
+        logger.warning("yt-dlp : aucun cookie configure (IG_COOKIES vide)")
+
+    cmd.append("https://www.instagram.com/{}/".format(username))
 
     try:
         result = subprocess.run(
@@ -133,7 +158,7 @@ def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
     return errors
 
 
-# ── METHODE 2 : instaloader avec login (stories & highlights) ─────────────────
+# ── METHODE 2 : instaloader avec cookies ──────────────────────────────────────
 def _build_loader() -> instaloader.Instaloader:
     L = instaloader.Instaloader(
         dirname_pattern=str(DOWNLOAD_DIR / "{target}"),
@@ -150,35 +175,49 @@ def _build_loader() -> instaloader.Instaloader:
     return L
 
 
-def _instaloader_login(L: instaloader.Instaloader) -> bool:
-    """Retourne True si login reussi."""
-    if not (IG_USER and IG_PASS):
+def _instaloader_login_cookies(L: instaloader.Instaloader) -> bool:
+    """
+    Charge la session instaloader depuis les cookies Netscape (IG_COOKIES).
+    Retourne True si reussi.
+    """
+    cookies_file = get_cookies_file()
+    if not cookies_file:
+        logger.warning("instaloader : IG_COOKIES vide, impossible de charger la session")
         return False
     try:
-        L.login(IG_USER, IG_PASS)
-        logger.info("Login Instagram OK : %s", IG_USER)
+        # instaloader peut importer une session depuis un fichier cookies Netscape
+        import http.cookiejar as cookiejar
+        jar = cookiejar.MozillaCookieJar(cookies_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+
+        # Injecter les cookies dans le contexte instaloader
+        session = L.context._session
+        for cookie in jar:
+            session.cookies.set(cookie.name, cookie.value, domain=cookie.domain)
+
+        # Verifier que sessionid est bien present
+        sessionid = session.cookies.get("sessionid", domain=".instagram.com")
+        if not sessionid:
+            logger.error("instaloader : sessionid absent des cookies")
+            return False
+
+        # Recuperer le username depuis ds_user_id n'est pas fiable,
+        # on force juste le test_login
+        L.context.username = "cookie_user"
+        logger.info("instaloader : cookies charges avec succes")
         return True
-    except instaloader.exceptions.BadCredentialsException:
-        logger.error("Login Instagram : mauvais identifiants")
-        return False
-    except instaloader.exceptions.TwoFactorAuthRequiredException:
-        logger.error("Login Instagram : 2FA active, impossible de se connecter")
-        return False
+
     except Exception as exc:
-        logger.warning("Login Instagram echoue : %s", exc)
+        logger.error("instaloader : erreur chargement cookies : %s", exc)
         return False
 
 
 def _instaloader_posts(username: str, profile_dir: Path) -> List[str]:
-    """
-    Fallback : telecharge les posts via instaloader avec login.
-    Utilise uniquement si yt-dlp n'a rien recupere.
-    """
     skipped: List[str] = []
     L = _build_loader()
-    logged_in = _instaloader_login(L)
+    logged_in = _instaloader_login_cookies(L)
     if not logged_in:
-        skipped.append("instaloader fallback : login requis pour posts.")
+        skipped.append("instaloader fallback : cookies requis pour posts.")
         return skipped
     try:
         profile = instaloader.Profile.from_username(L.context, username)
@@ -197,15 +236,12 @@ def _instaloader_posts(username: str, profile_dir: Path) -> List[str]:
 
 
 def _instaloader_stories(username: str, profile_dir: Path) -> List[str]:
-    """Telecharge stories + highlights via instaloader (login obligatoire)."""
+    """Telecharge stories + highlights via instaloader avec cookies."""
     skipped: List[str] = []
-    if not (IG_USER and IG_PASS):
-        skipped.append("Stories/Highlights : IG_USER et IG_PASS requis dans Railway.")
-        return skipped
 
     L = _build_loader()
-    if not _instaloader_login(L):
-        skipped.append("Stories : echec du login Instagram.")
+    if not _instaloader_login_cookies(L):
+        skipped.append("Stories/Highlights : echec du chargement des cookies.")
         return skipped
 
     try:
@@ -219,7 +255,6 @@ def _instaloader_stories(username: str, profile_dir: Path) -> List[str]:
         L.download_stories(userids=[profile.userid], filename_target=profile_dir)
     except TypeError:
         try:
-            # Ancienne signature instaloader
             L.download_storyitem  # test existence
             for item in L.get_stories(userids=[profile.userid]):
                 for story_item in item.get_items():
@@ -248,13 +283,6 @@ def _instaloader_stories(username: str, profile_dir: Path) -> List[str]:
 
 # ── Orchestrateur principal ───────────────────────────────────────────────────
 def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path], List[str]]:
-    """
-    Strategie :
-    - Posts/Reels  -> yt-dlp (sans login, plus fiable)
-                   -> fallback instaloader avec login si yt-dlp vide
-    - Stories      -> instaloader avec login
-    - Highlights   -> instaloader avec login
-    """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     profile_dir = DOWNLOAD_DIR / username
     if profile_dir.exists():
@@ -262,32 +290,30 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     all_skipped: List[str] = []
-    want_posts    = "posts"      in content_types or "reels" in content_types
-    want_stories  = "stories"    in content_types
+    want_posts      = "posts"      in content_types or "reels" in content_types
+    want_stories    = "stories"    in content_types
     want_highlights = "highlights" in content_types
 
-    # ── Posts & Reels via yt-dlp ──────────────────────────────────────────────
+    # ── Posts & Reels via yt-dlp avec cookies ────────────────────────────────
     if want_posts:
         logger.info("yt-dlp : telechargement posts/reels @%s", username)
         errs = _ytdlp_download(username, profile_dir)
         all_skipped.extend(errs)
 
-        # Verifier combien de fichiers recuperes
         files_after_ytdlp, _ = collect_media_files(profile_dir)
 
-        # Fallback instaloader si yt-dlp n'a rien donne
         if not files_after_ytdlp:
             logger.info("yt-dlp : aucun fichier, fallback instaloader")
             errs2 = _instaloader_posts(username, profile_dir)
             all_skipped.extend(errs2)
 
-    # ── Stories & Highlights via instaloader ──────────────────────────────────
+    # ── Stories & Highlights via instaloader avec cookies ────────────────────
     if want_stories or want_highlights:
         logger.info("instaloader : stories/highlights @%s", username)
         errs = _instaloader_stories(username, profile_dir)
         all_skipped.extend(errs)
 
-    # ── Collecter tous les fichiers ───────────────────────────────────────────
+    # ── Collecter tous les fichiers ──────────────────────────────────────────
     files, size_skipped = collect_media_files(profile_dir)
     all_skipped.extend(size_skipped)
 
@@ -330,29 +356,31 @@ async def send_file(bot, chat_id: int, thread_id: Optional[int], f: Path, captio
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    has_cookies = bool(IG_COOKIES)
+    status = "✅ Cookies Instagram configures" if has_cookies else "⚠️ IG_COOKIES manquant dans Railway"
     await update.message.reply_text(
         "👋 <b>Instagram Downloader Bot</b>\n\n"
         "Envoie un lien de profil Instagram ou un <code>@username</code>.\n\n"
         "Exemples :\n"
         "• <code>https://www.instagram.com/natgeo</code>\n"
         "• <code>@natgeo</code>\n\n"
-        "💡 En supergroupe avec Topics actives, chaque profil cree son propre fil.",
+        "🔐 {}\n\n"
+        "💡 En supergroupe avec Topics actives, chaque profil cree son propre fil.".format(status),
         parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    has_creds = bool(IG_USER and IG_PASS)
-    creds = "✅ configures" if has_creds else "❌ manquants (IG_USER / IG_PASS)"
+    has_cookies = bool(IG_COOKIES)
+    cookies_status = "✅ configures" if has_cookies else "❌ manquants (ajouter IG_COOKIES dans Railway)"
     group = "✅ {}".format(GROUP_ID) if GROUP_ID else "❌ non defini (envoi dans le chat courant)"
     await update.message.reply_text(
         "📖 <b>Aide</b>\n\n"
         "<b>Utilisation :</b> envoie un lien ou @username Instagram\n\n"
         "<b>Contenu :</b> Posts · Reels · Stories · A la une\n\n"
-        "<b>Identifiants Instagram :</b> {}\n"
+        "<b>Cookies Instagram :</b> {}\n"
         "<b>Groupe cible :</b> {}\n\n"
-        "<i>Posts/Reels : telecharges via yt-dlp (sans login)\n"
-        "Stories/Highlights : necessitent IG_USER + IG_PASS</i>".format(creds, group),
+        "<i>Toutes les fonctions utilisent les cookies (methode fiable, sans checkpoint)</i>".format(cookies_status, group),
         parse_mode=ParseMode.HTML,
     )
 
@@ -371,8 +399,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["ig_username"] = username
 
-    has_creds = bool(IG_USER and IG_PASS)
-    note = "" if has_creds else "\n\n⚠️ <i>Stories/Highlights : IG_USER et IG_PASS non configures.</i>"
+    has_cookies = bool(IG_COOKIES)
+    note = "" if has_cookies else "\n\n⚠️ <i>IG_COOKIES non configure dans Railway.</i>"
 
     keyboard = [
         [
