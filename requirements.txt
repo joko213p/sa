@@ -1,0 +1,3 @@
+python-telegram-bot==21.6
+instaloader>=4.13
+yt-dlp>=2024.11.18
