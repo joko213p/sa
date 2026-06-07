@@ -30,15 +30,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-IG_COOKIES = os.environ.get("IG_COOKIES", "")
-_raw_group = os.environ.get("GROUP_ID", "")
-GROUP_ID   = int(_raw_group) if _raw_group else None
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+IG_COOKIES  = os.environ.get("IG_COOKIES", "")
+_raw_group  = os.environ.get("GROUP_ID", "")
+GROUP_ID    = int(_raw_group) if _raw_group else None
+HTTP_PROXY  = os.environ.get("HTTP_PROXY", "")
+HTTPS_PROXY = os.environ.get("HTTPS_PROXY", HTTP_PROXY)
 
 DOWNLOAD_DIR   = Path("/tmp/ig_downloads")
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 Mo
 
-# User-Agent mobile pour éviter les blocages Instagram
 MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -66,7 +67,6 @@ def get_cookies_file() -> Optional[str]:
 
 
 def load_cookies_into_session(session) -> bool:
-    """Charge les cookies Netscape dans une session requests."""
     cookies_file = get_cookies_file()
     if not cookies_file:
         return False
@@ -79,7 +79,7 @@ def load_cookies_into_session(session) -> bool:
         if not sessionid:
             logger.error("sessionid absent des cookies")
             return False
-        logger.info("Cookies charges avec succes (sessionid present)")
+        logger.info("Cookies charges OK")
         return True
     except Exception as exc:
         logger.error("Erreur chargement cookies : %s", exc)
@@ -135,7 +135,7 @@ def collect_media_files(directory: Path) -> Tuple[List[Path], List[str]]:
     return files, skipped
 
 
-# ── METHODE 1 : yt-dlp avec cookies + User-Agent mobile ──────────────────────
+# ── METHODE 1 : yt-dlp avec cookies + proxy ───────────────────────────────────
 def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
     profile_dir.mkdir(parents=True, exist_ok=True)
     errors: List[str] = []
@@ -159,6 +159,10 @@ def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
     if cookies_file:
         cmd += ["--cookies", cookies_file]
 
+    if HTTPS_PROXY:
+        cmd += ["--proxy", HTTPS_PROXY]
+        logger.info("yt-dlp : proxy actif")
+
     cmd.append("https://www.instagram.com/{}/".format(username))
 
     try:
@@ -179,7 +183,7 @@ def _ytdlp_download(username: str, profile_dir: Path) -> List[str]:
     return errors
 
 
-# ── METHODE 2 : instaloader avec cookies (API iPhone) ────────────────────────
+# ── METHODE 2 : instaloader avec cookies + proxy ──────────────────────────────
 def _build_loader() -> instaloader.Instaloader:
     L = instaloader.Instaloader(
         dirname_pattern=str(DOWNLOAD_DIR / "{target}"),
@@ -198,27 +202,32 @@ def _build_loader() -> instaloader.Instaloader:
 
 
 def _instaloader_login(L: instaloader.Instaloader) -> bool:
-    """Charge les cookies dans la session instaloader."""
+    # Configurer le proxy dans la session requests
+    if HTTPS_PROXY:
+        L.context._session.proxies.update({
+            "http":  HTTP_PROXY or HTTPS_PROXY,
+            "https": HTTPS_PROXY,
+        })
+        logger.info("instaloader : proxy actif")
+
+    # Charger les cookies
     if not load_cookies_into_session(L.context._session):
         return False
 
-    # Appliquer aussi le User-Agent dans les headers de session
     L.context._session.headers.update({
         "User-Agent": MOBILE_UA,
         "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
         "X-IG-App-ID": "936619743392459",
     })
 
-    # Tester si le login est valide via l'API iPhone
     try:
         data = L.context.get_iphone_json("/api/v1/accounts/current_user/", {})
         username = data.get("user", {}).get("username", "inconnu")
-        logger.info("Instaloader connecte via cookies : @%s", username)
+        logger.info("Instaloader connecte : @%s", username)
         L.context.username = username
         return True
     except Exception as exc:
-        logger.warning("Test login iPhone API echoue : %s — on continue quand meme", exc)
-        # On continue quand meme, les cookies sont peut-etre valides pour d'autres appels
+        logger.warning("Test login echoue : %s — on continue", exc)
         L.context.username = "cookie_user"
         return True
 
@@ -234,7 +243,6 @@ def _instaloader_posts(username: str, profile_dir: Path) -> List[str]:
         for post in profile.get_posts():
             try:
                 L.download_post(post, target=profile_dir)
-                asyncio.sleep(1)  # pause anti-rate-limit
             except Exception as exc:
                 skipped.append("post {}: {}".format(post.shortcode, exc))
     except instaloader.exceptions.ProfileNotExistsException:
@@ -357,31 +365,36 @@ async def send_file(bot, chat_id: int, thread_id: Optional[int], f: Path, captio
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_cookies = bool(IG_COOKIES)
-    status = "✅ Cookies configures" if has_cookies else "⚠️ IG_COOKIES manquant dans Railway"
+    has_proxy   = bool(HTTPS_PROXY)
+    status_cookies = "✅ Cookies configures" if has_cookies else "⚠️ IG_COOKIES manquant"
+    status_proxy   = "✅ Proxy actif" if has_proxy else "⚠️ Pas de proxy (HTTPS_PROXY manquant)"
     await update.message.reply_text(
         "👋 <b>Instagram Downloader Bot</b>\n\n"
         "Envoie un lien de profil Instagram ou un <code>@username</code>.\n\n"
         "Exemples :\n"
         "• <code>https://www.instagram.com/natgeo</code>\n"
         "• <code>@natgeo</code>\n\n"
-        "🔐 {}\n\n"
-        "💡 En supergroupe avec Topics, chaque profil cree son propre fil.".format(status),
+        "🔐 {}\n"
+        "🌐 {}".format(status_cookies, status_proxy),
         parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_cookies = bool(IG_COOKIES)
-    cookies_status = "✅ configures" if has_cookies else "❌ manquants (ajouter IG_COOKIES dans Railway)"
-    group = "✅ {}".format(GROUP_ID) if GROUP_ID else "❌ non defini (envoi dans le chat courant)"
+    has_proxy   = bool(HTTPS_PROXY)
+    group = "✅ {}".format(GROUP_ID) if GROUP_ID else "❌ non defini"
     await update.message.reply_text(
         "📖 <b>Aide</b>\n\n"
         "<b>Utilisation :</b> lien ou @username Instagram\n\n"
         "<b>Contenu :</b> Posts · Reels · Stories · A la une\n\n"
-        "<b>Cookies Instagram :</b> {}\n"
-        "<b>Groupe cible :</b> {}\n\n"
-        "<i>Authentification par cookies — methode fiable sans checkpoint</i>".format(
-            cookies_status, group),
+        "<b>Cookies :</b> {}\n"
+        "<b>Proxy :</b> {}\n"
+        "<b>Groupe cible :</b> {}".format(
+            "✅" if has_cookies else "❌ manquant",
+            "✅" if has_proxy   else "❌ manquant",
+            group,
+        ),
         parse_mode=ParseMode.HTML,
     )
 
@@ -399,8 +412,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["ig_username"] = username
-    has_cookies = bool(IG_COOKIES)
-    note = "" if has_cookies else "\n\n⚠️ <i>IG_COOKIES non configure dans Railway.</i>"
 
     keyboard = [
         [
@@ -415,7 +426,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        "📲 Profil : <b>@{}</b>\n\nQue veux-tu telecharger ?{}".format(esc(username), note),
+        "📲 Profil : <b>@{}</b>\n\nQue veux-tu telecharger ?".format(esc(username)),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
